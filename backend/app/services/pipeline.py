@@ -5,11 +5,16 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
+import os
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
+from app.config import settings
 from app.store import store
 
 
@@ -26,8 +31,23 @@ def _next_id(module: str) -> int:
     return max((int(r.get("id", 0)) for r in store.rows(module)), default=0) + 1
 
 
+def _export_dir() -> Path:
+    """交付文件落盘目录：环境变量优先，其次配置默认。"""
+    return Path(os.environ.get("LOG_INGEST_EXPORT_DIR", settings.export_dir))
+
+
+def _safe_name(name: str) -> str:
+    """视图/批次名转文件名片段，避免路径分隔符等非法字符。"""
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
+
+
 class IngestPipeline:
     """采集流水线统一编排，管理从数据源到导出的完整数据链路。"""
+
+    def __init__(self) -> None:
+        # 计数发布锁：聚合刷新与交付写盘必须整体成一套完整修订，
+        # 迟到更正/邻批校验并发进来时也不会出现计数与明细对不上的中间态。
+        self._publish_lock = threading.RLock()
 
     # ---------- 阶段0：数据源登记与版本 ----------
     def register_source(self, source_id: str, protocol: str, region: str) -> dict[str, Any]:
@@ -143,11 +163,25 @@ class IngestPipeline:
         batch_no: str,
         parser_rule_name: str | None = None,
     ) -> dict[str, Any]:
-        """解析批次中的原始日志为标准化明细。"""
+        """解析批次中的原始日志为标准化明细。
+
+        读取范围按批次重新确认：只取本批仍处「待解析」的原始记录，
+        已解析的不再重复产出明细，恢复中断批次时也不会混入他批数据。
+        """
         raw_records_list = store.rows("raw_records")
-        batch_raw = [r for r in raw_records_list if r.get("批次编号") == batch_no]
-        if not batch_raw:
+        batch_raw_all = [r for r in raw_records_list if r.get("批次编号") == batch_no]
+        if not batch_raw_all:
             return {"ok": False, "message": f"批次 {batch_no} 无原始日志记录"}
+        batch_raw = [r for r in batch_raw_all if r.get("status") == "待解析"]
+        if not batch_raw:
+            return {
+                "ok": True,
+                "message": f"批次 {batch_no} 无待解析的新记录",
+                "success": 0,
+                "failure": 0,
+                "parsed_ids": [],
+                "failed_ids": [],
+            }
 
         # 查找匹配的解析规则
         parsers = store.rows("field_parser")
@@ -221,7 +255,12 @@ class IngestPipeline:
                 b["status"] = "已完成" if failure_count == 0 else "部分失败"
                 b["pending"] = failure_count > 0
                 b["abnormal"] = failure_count > 0
-                b["parsed_ids"] = json.dumps(parsed_ids)
+                # 累加本批已产出的明细ID，恢复/补采再解析时不覆盖历史回执
+                try:
+                    prior_ids = json.loads(b.get("parsed_ids") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    prior_ids = []
+                b["parsed_ids"] = json.dumps([*prior_ids, *parsed_ids])
                 b["batch_version"] = b.get("batch_version", 1) + 1
                 break
 
@@ -286,14 +325,97 @@ class IngestPipeline:
                 fields[fn] = parts[i].strip() if i < len(parts) else ""
         return fields
 
+    # ---------- 迟到更正 ----------
+    def add_batch_correction(
+        self,
+        batch_no: str,
+        raw_logs: list[dict[str, Any]],
+        parser_rule_name: str | None = None,
+    ) -> dict[str, Any]:
+        """向已存在的批次写入迟到更正行：原始行号在本批内顺延，
+        新增行立即按本批读取范围解析并校验，供计数发布重新计算。
+        """
+        batches = store.rows("ingest_batch")
+        batch_entry = None
+        for b in batches:
+            if b.get("批次编号") == batch_no:
+                batch_entry = b
+                break
+        if batch_entry is None:
+            return {"ok": False, "message": f"批次 {batch_no} 不存在"}
+        if not raw_logs:
+            return {"ok": False, "message": "迟到更正内容为空"}
+
+        raw_records_list = store.rows("raw_records")
+        batch_raw = [r for r in raw_records_list if r.get("批次编号") == batch_no]
+        # 行号在本批现有最大值上顺延，保证详单原文行号唯一可追溯
+        line_no = 0
+        for r in batch_raw:
+            try:
+                line_no = max(line_no, int(r.get("原始行号", "0") or 0))
+            except (TypeError, ValueError):
+                continue
+
+        created_ids: list[int] = []
+        for log in raw_logs:
+            line_no += 1
+            raw_id = _next_id("raw_records")
+            record = {
+                "id": raw_id,
+                "批次编号": batch_no,
+                "原始行号": str(line_no),
+                "采集时间戳": _now_iso(),
+                "原始正文": log.get("body", str(log)),
+                "解析状态": "未解析",
+                "status": "待解析",
+                "pending": True,
+                "abnormal": False,
+                "batch_version": batch_entry.get("batch_version", 1),
+                "source_id": batch_entry.get("所属数据源"),
+                "ingested_at": _now_iso(),
+                "late_correction": True,
+            }
+            raw_records_list.append(record)
+            created_ids.append(raw_id)
+
+        # 批次回执同步：记录总数与原始记录范围一并更新
+        try:
+            raw_ids = json.loads(batch_entry.get("raw_record_ids") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            raw_ids = []
+        raw_ids.extend(created_ids)
+        batch_entry["raw_record_ids"] = json.dumps(raw_ids)
+        batch_entry["记录总数"] = str(len(raw_ids))
+        batch_entry["batch_version"] = batch_entry.get("batch_version", 1) + 1
+        batch_entry["corrected_at"] = _now_iso()
+
+        # 只解析本批待处理的新行（读取范围按批次重新确认），随后校验
+        parse_result = self.parse_batch(batch_no, parser_rule_name)
+        validate_result = self.validate_entities(batch_no)
+
+        return {
+            "ok": True,
+            "message": f"批次 {batch_no} 已写入 {len(created_ids)} 行迟到更正",
+            "batch_no": batch_no,
+            "added_raw_ids": created_ids,
+            "line_range": [str(line_no - len(created_ids) + 1), str(line_no)],
+            "parsed": parse_result.get("success", 0),
+            "validated": validate_result.get("passed", 0),
+        }
+
     # ---------- 阶段3：去重 ----------
     def run_dedup(
         self,
         dedup_key_fields: list[str],
         window: str,
         retain_strategy: str = "keep_first",
+        batch_no: str | None = None,
     ) -> dict[str, Any]:
-        """对标准化明细执行去重。"""
+        """对标准化明细执行去重。
+
+        去重范围按批次隔离：显式给定 batch_no 时只处理本批；
+        窗口为 batch 时按来源批次分组各自去重，邻批出数不会改动本批明细状态。
+        """
         dedup_strategies = store.rows("dedup_engine")
         parsed = store.rows("parsed_entity")
 
@@ -304,18 +426,21 @@ class IngestPipeline:
             "去重键字段": ",".join(dedup_key_fields),
             "去重窗口": window,
             "保留策略": retain_strategy,
-            "生效数据源": "全部",
+            "生效数据源": batch_no or "全部",
             "status": "已生效",
             "pending": False,
             "abnormal": False,
         }
         dedup_strategies.append(strategy_entry)
 
-        # 执行去重
+        # 执行去重：键空间按批次隔离，同一键值跨批不互相驱逐
         seen: dict[str, int] = {}
         duplicates = 0
         for rec in parsed:
             if rec.get("status") != "校验通过":
+                continue
+            rec_batch = rec.get("来源批次", "")
+            if batch_no is not None and rec_batch != batch_no:
                 continue
             fields_json = rec.get("标准化字段集", "{}")
             try:
@@ -324,30 +449,36 @@ class IngestPipeline:
                 fields_data = {}
             key_parts = [str(fields_data.get(k, "")) for k in dedup_key_fields]
             key = "||".join(key_parts)
-            if key in seen:
+            if batch_no is None and window != "batch":
+                scope = "__global__"
+            else:
+                scope = str(rec_batch)
+            scoped_key = f"{scope}::{key}"
+            if scoped_key in seen:
                 if retain_strategy == "keep_first":
                     rec["status"] = "校验失败"
                     rec["abnormal"] = True
-                    rec["dedup_id"] = str(seen[key])
+                    rec["dedup_id"] = str(seen[scoped_key])
                     duplicates += 1
                 else:
                     # keep_last：把旧记录标记为重复
-                    old = store.find("parsed_entity", seen[key])
+                    old = store.find("parsed_entity", seen[scoped_key])
                     if old:
                         old["status"] = "校验失败"
                         old["abnormal"] = True
                         old["dedup_id"] = str(rec["id"])
                     rec["status"] = "校验通过"
                     rec["dedup_id"] = ""
-                    seen[key] = rec["id"]
+                    seen[scoped_key] = rec["id"]
             else:
-                seen[key] = rec["id"]
+                seen[scoped_key] = rec["id"]
 
         return {
             "ok": True,
             "message": f"去重完成",
             "strategy": strategy_entry["策略名称"],
             "dedup_key_fields": dedup_key_fields,
+            "batch_no": batch_no,
             "duplicates_found": duplicates,
             "unique_keys": len(seen),
         }
@@ -408,56 +539,100 @@ class IngestPipeline:
         dim_field: str,
         metric_field: str,
         agg_func: str = "count",
+        batch_no: str | None = None,
     ) -> dict[str, Any]:
-        """基于标准化明细刷新聚合视图。"""
-        parsed = store.rows("parsed_entity")
-        results: dict[str, dict[str, Any]] = {}
+        """基于标准化明细刷新聚合视图。
 
-        for entity in parsed:
-            if entity.get("status") != "校验通过":
-                continue
-            try:
-                fields_data = json.loads(entity.get("标准化字段集", "{}"))
-            except (json.JSONDecodeError, TypeError):
-                continue
+        批次统计只取本批「校验通过」的可用明细；视图落库时保留取数依据
+        （来源批次 + 明细ID清单），计数与其引用的明细一一对应。
+        同名视图按完整修订原地更新（兼容已有批次回执），并发刷新在发布锁
+        下整体生效，不会出现计数与明细对不上的中间态。
+        """
+        with self._publish_lock:
+            parsed = store.rows("parsed_entity")
+            aggs = store.rows("aggregation_view")
 
-            dim_val = str(fields_data.get(dim_field, "unknown"))
-            metric_val = fields_data.get(metric_field, "0")
+            # 兼容已有批次回执：未显式指定批次时沿用视图已登记的批次范围
+            existing = None
+            for a in aggs:
+                if a.get("视图名称") == view_name:
+                    existing = a
+            if batch_no is None and existing is not None:
+                batch_no = existing.get("batch_no") or None
 
-            if dim_val not in results:
-                results[dim_val] = {"count": 0, "sum": 0.0, "values": []}
+            # 先快照本批可用明细，再按快照计算，保证计数与引用明细一致
+            candidates = [p for p in parsed if p.get("status") == "校验通过"]
+            if batch_no is not None:
+                candidates = [p for p in candidates if p.get("来源批次") == batch_no]
 
-            results[dim_val]["count"] += 1
-            try:
-                results[dim_val]["sum"] += float(metric_val) if metric_val else 0.0
-            except (ValueError, TypeError):
-                pass
-            results[dim_val]["values"].append(metric_val)
+            results: dict[str, dict[str, Any]] = {}
+            source_ids: list[int] = []
+            for entity in candidates:
+                try:
+                    fields_data = json.loads(entity.get("标准化字段集", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(fields_data, dict):
+                    continue
 
-        # 创建/更新聚合视图
-        aggs = store.rows("aggregation_view")
-        agg_entry = {
-            "id": _next_id("aggregation_view"),
-            "视图名称": view_name,
-            "聚合维度": dim_field,
-            "指标定义": f"{agg_func}({metric_field})",
-            "数据源范围": "标准化明细",
-            "刷新间隔": "manual",
-            "status": "已生效",
-            "pending": False,
-            "abnormal": False,
-            "results": results,
-            "refreshed_at": _now_iso(),
-            "source_records": len(parsed),
-        }
-        aggs.append(agg_entry)
+                dim_val = str(fields_data.get(dim_field, "unknown"))
+                metric_val = fields_data.get(metric_field, "0")
 
-        return {
-            "ok": True,
-            "message": f"聚合视图 {view_name} 已刷新",
-            "view": agg_entry,
-            "dimensions": len(results),
-        }
+                if dim_val not in results:
+                    results[dim_val] = {"count": 0, "sum": 0.0, "values": []}
+
+                results[dim_val]["count"] += 1
+                try:
+                    results[dim_val]["sum"] += float(metric_val) if metric_val else 0.0
+                except (ValueError, TypeError):
+                    pass
+                results[dim_val]["values"].append(metric_val)
+                # 取数依据：只有真正计入结果的明细才进入引用清单
+                source_ids.append(int(entity["id"]))
+
+            if existing is not None:
+                # 原地发布一套完整修订：结果、取数依据、修订号同时替换
+                existing["聚合维度"] = dim_field
+                existing["指标定义"] = f"{agg_func}({metric_field})"
+                existing["batch_no"] = batch_no
+                existing["results"] = results
+                existing["source_entity_ids"] = json.dumps(source_ids)
+                existing["source_records"] = len(source_ids)
+                existing["revision"] = int(existing.get("revision", 1)) + 1
+                existing["status"] = "已生效"
+                existing["pending"] = False
+                existing["abnormal"] = False
+                existing["refreshed_at"] = _now_iso()
+                agg_entry = existing
+            else:
+                agg_entry = {
+                    "id": _next_id("aggregation_view"),
+                    "视图名称": view_name,
+                    "聚合维度": dim_field,
+                    "指标定义": f"{agg_func}({metric_field})",
+                    "数据源范围": f"标准化明细/{batch_no}" if batch_no else "标准化明细",
+                    "刷新间隔": "manual",
+                    "status": "已生效",
+                    "pending": False,
+                    "abnormal": False,
+                    "batch_no": batch_no,
+                    "results": results,
+                    "source_entity_ids": json.dumps(source_ids),
+                    "source_records": len(source_ids),
+                    "revision": 1,
+                    "refreshed_at": _now_iso(),
+                }
+                aggs.append(agg_entry)
+
+            return {
+                "ok": True,
+                "message": f"聚合视图 {view_name} 已刷新",
+                "view": agg_entry,
+                "batch_no": batch_no,
+                "revision": agg_entry["revision"],
+                "source_records": len(source_ids),
+                "dimensions": len(results),
+            }
 
     # ---------- 阶段6：数据导出 ----------
     def build_export(
@@ -466,59 +641,167 @@ class IngestPipeline:
         export_format: str = "csv",
         filters: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """从聚合视图或标准化明细生成导出数据。"""
-        exports = store.rows("data_export")
-        lineages = store.rows("data_lineage")
+        """从聚合视图交付本批数据：写摘要与详单文件，并回写文件索引清单。
 
-        # 查找目标视图
-        aggs = store.rows("aggregation_view")
-        view = None
-        for a in aggs:
-            if a.get("视图名称") == view_name:
-                view = a
-                break
+        详单按视图登记的取数依据（source_entity_ids）逐条展开，带出原始
+        行号供下游对账；只统计对应批次的可用明细，邻批数据不进入本次交付。
+        """
+        with self._publish_lock:
+            exports = store.rows("data_export")
+            lineages = store.rows("data_lineage")
 
-        results_data = view.get("results", {}) if view else {}
+            # 查找目标视图：同名视图只保留一套完整修订，取最新一条回执
+            aggs = store.rows("aggregation_view")
+            view = None
+            for a in aggs:
+                if a.get("视图名称") == view_name:
+                    view = a
 
-        export_id = _next_id("data_export")
-        export_entry = {
-            "id": export_id,
-            "导出范围": view_name,
-            "目标格式": export_format,
-            "过滤条件": json.dumps(filters or {}, ensure_ascii=False),
-            "导出状态": "",
-            "文件路径": f"/exports/{view_name}.{export_format}",
-            "status": "已完成",
-            "pending": False,
-            "abnormal": False,
-            "results": results_data,
-            "record_count": len(results_data),
-            "exported_at": _now_iso(),
-        }
-        exports.append(export_entry)
+            results_data = view.get("results", {}) if view else {}
+            batch_no = view.get("batch_no") if view else None
+            revision = int(view.get("revision", 1)) if view else 0
+            try:
+                source_ids = json.loads(view.get("source_entity_ids") or "[]") if view else []
+            except (json.JSONDecodeError, TypeError):
+                source_ids = []
 
-        # 记录血缘
-        lineage_entry = {
-            "id": _next_id("data_lineage"),
-            "来源批次": view_name,
-            "解析规则版本": view.get("视图名称", "unknown") if view else "unknown",
-            "标准化版本": view_name,
-            "下游消费标识": f"export-{export_id}",
-            "记录时间": _now_iso(),
-            "status": "已记录",
-            "pending": False,
-            "abnormal": False,
-            "export_id": str(export_id),
-            "export_format": export_format,
-        }
-        lineages.append(lineage_entry)
+            # 详单：按取数依据展开明细，关联原始记录拿到原文行号
+            details: list[dict[str, Any]] = []
+            for pid in source_ids:
+                entity = store.find("parsed_entity", int(pid))
+                if entity is None:
+                    continue
+                raw = None
+                try:
+                    raw = store.find("raw_records", int(entity.get("原始记录ID", "0") or 0))
+                except (TypeError, ValueError):
+                    raw = None
+                details.append({
+                    "明细ID": entity.get("id"),
+                    "来源批次": entity.get("来源批次", ""),
+                    "原始记录ID": entity.get("原始记录ID", ""),
+                    "原始行号": raw.get("原始行号", "") if raw else "",
+                    "解析规则版本": entity.get("解析规则版本", ""),
+                    "校验状态": entity.get("status", ""),
+                    "标准化字段集": entity.get("标准化字段集", ""),
+                })
 
-        return {
-            "ok": True,
-            "message": f"数据导出 {view_name}.{export_format} 完成",
-            "export": export_entry,
-            "lineage": lineage_entry,
-        }
+            export_id = _next_id("data_export")
+            exported_at = _now_iso()
+
+            # 交付写盘：本批摘要 + 详单，随后回写文件索引清单
+            export_dir = _export_dir()
+            export_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"{_safe_name(view_name)}_r{revision}"
+            summary_path = export_dir / f"{stem}_summary.json"
+            detail_path = export_dir / f"{stem}_detail.csv"
+
+            summary_doc = {
+                "视图名称": view_name,
+                "批次编号": batch_no,
+                "revision": revision,
+                "聚合维度": view.get("聚合维度") if view else None,
+                "指标定义": view.get("指标定义") if view else None,
+                "统计结果": results_data,
+                "明细数": len(details),
+                "维度数": len(results_data),
+                "过滤条件": filters or {},
+                "exported_at": exported_at,
+            }
+            summary_path.write_text(
+                json.dumps(summary_doc, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+            with detail_path.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(
+                    fh,
+                    fieldnames=["明细ID", "来源批次", "原始记录ID", "原始行号",
+                                "解析规则版本", "校验状态", "标准化字段集"],
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(details)
+
+            export_entry = {
+                "id": export_id,
+                "导出范围": view_name,
+                "目标格式": export_format,
+                "过滤条件": json.dumps(filters or {}, ensure_ascii=False),
+                "导出状态": "",
+                "文件路径": str(summary_path),
+                "status": "已完成",
+                "pending": False,
+                "abnormal": False,
+                "batch_no": batch_no,
+                "revision": revision,
+                "results": results_data,
+                "record_count": len(details),
+                "dimension_count": len(results_data),
+                "summary_file": str(summary_path),
+                "detail_file": str(detail_path),
+                "exported_at": exported_at,
+            }
+            exports.append(export_entry)
+
+            # 文件索引清单：登记本次交付的摘要/详单，供实际对账检索
+            manifest_path = export_dir / "index.json"
+            manifest = self._read_manifest(manifest_path)
+            manifest["exports"].append({
+                "export_id": export_id,
+                "视图名称": view_name,
+                "批次编号": batch_no,
+                "revision": revision,
+                "摘要文件": str(summary_path),
+                "详单文件": str(detail_path),
+                "明细数": len(details),
+                "维度数": len(results_data),
+                "exported_at": exported_at,
+            })
+            tmp_path = manifest_path.with_suffix(".json.tmp")
+            tmp_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            os.replace(tmp_path, manifest_path)
+
+            # 记录血缘
+            lineage_entry = {
+                "id": _next_id("data_lineage"),
+                "来源批次": batch_no or view_name,
+                "解析规则版本": view.get("视图名称", "unknown") if view else "unknown",
+                "标准化版本": view_name,
+                "下游消费标识": f"export-{export_id}",
+                "记录时间": exported_at,
+                "status": "已记录",
+                "pending": False,
+                "abnormal": False,
+                "export_id": str(export_id),
+                "export_format": export_format,
+                "revision": revision,
+            }
+            lineages.append(lineage_entry)
+
+            return {
+                "ok": True,
+                "message": f"数据导出 {view_name}.{export_format} 完成",
+                "export": export_entry,
+                "lineage": lineage_entry,
+                "batch_no": batch_no,
+                "record_count": len(details),
+                "summary_file": str(summary_path),
+                "detail_file": str(detail_path),
+                "manifest": str(manifest_path),
+            }
+
+    @staticmethod
+    def _read_manifest(manifest_path: Path) -> dict[str, Any]:
+        """读取文件索引清单；不存在或损坏时返回空清单。"""
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("exports"), list):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {"exports": []}
 
     # ---------- 水位管理 ----------
     def advance_watermark(
@@ -663,11 +946,19 @@ class IngestPipeline:
         """执行完整采集 → 解析 → 去重 → 校验 → 聚合 → 导出的全链路。"""
         steps: dict[str, Any] = {}
 
-        # S0: 登记并验证数据源
+        # S0: 登记并验证数据源（同源邻批重跑时沿用已登记数据源）
         reg = self.register_source(source_id, "http", "default")
         if not reg["ok"]:
-            return {"ok": False, "message": reg["message"]}
-        self.validate_source(source_id)
+            existing = None
+            for s in store.rows("source_registry"):
+                if s.get("来源标识") == source_id:
+                    existing = s
+                    break
+            if existing is None:
+                return {"ok": False, "message": reg["message"]}
+            reg = {"ok": True, "message": reg["message"], "entry": existing}
+        if reg["entry"].get("status") != "已验证":
+            self.validate_source(source_id)
         steps["source_registry"] = reg
 
         # S1: 启动采集批次
@@ -685,12 +976,14 @@ class IngestPipeline:
         valid_result = self.validate_entities(batch_no)
         steps["validate"] = valid_result
 
-        # S4: 去重
-        dedup_result = self.run_dedup(["time", "level"], "batch", "keep_first")
+        # S4: 去重（按本批隔离，邻批明细不参与）
+        dedup_result = self.run_dedup(["time", "level"], "batch", "keep_first", batch_no=batch_no)
         steps["dedup"] = dedup_result
 
-        # S5: 聚合
-        agg_result = self.refresh_aggregation(f"view-{batch_no}", "level", "time", "count")
+        # S5: 聚合（只统计本批标准化明细）
+        agg_result = self.refresh_aggregation(
+            f"view-{batch_no}", "level", "time", "count", batch_no=batch_no
+        )
         steps["aggregation"] = agg_result
 
         # S6: 导出
@@ -710,12 +1003,32 @@ class IngestPipeline:
 
     # ---------- 失败恢复 ----------
     def recover_batch(self, batch_no: str) -> dict[str, Any]:
-        """恢复失败的采集批次：重试解析失败记录。"""
+        """恢复失败的采集批次：重试解析失败记录。
+
+        恢复范围按批次重新确认：优先以批次回执登记的 raw_record_ids 为准，
+        旧批次缺少回执时退化为按批次编号扫描，绝不越出本批读取范围。
+        """
         retry_q = store.rows("retry_queue")
         raw_records_list = store.rows("raw_records")
 
-        failed_raw = [r for r in raw_records_list
-                      if r.get("批次编号") == batch_no and r.get("status") == "解析失败"]
+        # 按批次重新确认读取范围
+        scope_ids: set[int] | None = None
+        for b in store.rows("ingest_batch"):
+            if b.get("批次编号") == batch_no:
+                try:
+                    ids = json.loads(b.get("raw_record_ids") or "[]")
+                    scope_ids = {int(i) for i in ids}
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    scope_ids = None
+                break
+
+        failed_raw = []
+        for r in raw_records_list:
+            if r.get("批次编号") != batch_no or r.get("status") != "解析失败":
+                continue
+            if scope_ids is not None and int(r.get("id", 0)) not in scope_ids:
+                continue
+            failed_raw.append(r)
 
         recovered = 0
         still_failed = 0
@@ -737,11 +1050,11 @@ class IngestPipeline:
                 retry_entry["status"] = "重试中"
                 retry_entry["下次重试时间"] = _now_iso()
 
-            # 重试解析
+            # 重试解析：失败记录一律放回待解析，重试队列仅作计数跟踪
             body = raw.get("原始正文", "")
             parts = body.split("|") if "|" in body else [body]
             if len(parts) >= 2:
-                raw["status"] = "待解析" if retry_entry else raw["status"]
+                raw["status"] = "待解析"
                 raw["解析状态"] = "待解析"
                 raw["pending"] = True
                 raw["abnormal"] = False

@@ -17,6 +17,13 @@ def reset_store():
     yield
 
 
+@pytest.fixture(autouse=True)
+def isolate_export_dir(tmp_path, monkeypatch):
+    """交付文件（摘要/详单/文件索引清单）写入每测试独立的临时目录。"""
+    monkeypatch.setenv("LOG_INGEST_EXPORT_DIR", str(tmp_path / "exports"))
+    yield
+
+
 @pytest.fixture
 def pipeline():
     from app.services.pipeline import pipeline as p

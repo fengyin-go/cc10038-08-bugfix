@@ -5,7 +5,11 @@ raw_records → field_parser → parsed_entity → dedup_engine →
 aggregation_view → data_export)."""
 from __future__ import annotations
 
+import csv
 import json
+import os
+import threading
+
 import pytest
 
 from app.store import store
@@ -452,3 +456,208 @@ class TestCrossModuleSnapshot:
 
         raw_snap = SERVICES["raw_records"].domain_snapshot()
         assert raw_snap["count"] > 0
+
+
+class TestBatchIsolation:
+    """混批修复验收：两批同级别日志跑全链路，统计、聚合与对账按批隔离。"""
+
+    @staticmethod
+    def _logs_a():
+        return [
+            {"body": "2026-01-15T10:00:00|INFO|a-first"},
+            {"body": "2026-01-15T10:01:00|INFO|a-second"},
+            {"body": "2026-01-15T10:02:00|WARN|a-third"},
+        ]
+
+    @staticmethod
+    def _logs_b():
+        # 与 A 批同级别，且首行 time+level 与 A 批完全相同的邻批日志
+        return [
+            {"body": "2026-01-15T10:00:00|INFO|b-first"},
+            {"body": "2026-01-16T10:01:00|INFO|b-second"},
+            {"body": "2026-01-16T10:02:00|ERROR|b-third"},
+        ]
+
+    @staticmethod
+    def _view(view_name):
+        for v in store.rows("aggregation_view"):
+            if v.get("视图名称") == view_name:
+                return v
+        return None
+
+    def test_two_batches_do_not_mix(self, pipeline):
+        ra = pipeline.run_full_pipeline("iso-src", "2026-01-15", self._logs_a())
+        assert ra["ok"] is True
+        rb = pipeline.run_full_pipeline("iso-src", "2026-01-16", self._logs_b())
+        assert rb["ok"] is True
+        batch_a, batch_b = ra["batch_no"], rb["batch_no"]
+        assert batch_a != batch_b
+
+        view_a = self._view(f"view-{batch_a}")
+        view_b = self._view(f"view-{batch_b}")
+        # 本批统计只含本批明细：A 批 INFO=2/WARN=1，B 批 INFO=2/ERROR=1
+        assert view_a["results"]["INFO"]["count"] == 2
+        assert view_a["results"]["WARN"]["count"] == 1
+        assert "ERROR" not in view_a["results"]
+        assert view_b["results"]["INFO"]["count"] == 2
+        assert view_b["results"]["ERROR"]["count"] == 1
+        assert "WARN" not in view_b["results"]
+        # 取数依据：视图登记来源批次与明细ID清单，计数与引用明细一致
+        assert view_a["batch_no"] == batch_a
+        ids_a = json.loads(view_a["source_entity_ids"])
+        assert view_a["source_records"] == len(ids_a) == 3
+        assert sum(d["count"] for d in view_a["results"].values()) == len(ids_a)
+        entities_a = [p for p in store.rows("parsed_entity")
+                      if p.get("来源批次") == batch_a and p.get("status") == "校验通过"]
+        assert sorted(ids_a) == sorted(int(p["id"]) for p in entities_a)
+
+    def test_neighbor_batch_does_not_change_persisted_counts(self, pipeline):
+        ra = pipeline.run_full_pipeline("stable-src", "2026-01-15", self._logs_a())
+        batch_a = ra["batch_no"]
+        view_name = f"view-{batch_a}"
+        before = self._view(view_name)
+        snapshot = (json.dumps(before["results"], sort_keys=True), before["revision"],
+                    before["source_entity_ids"])
+
+        rb = pipeline.run_full_pipeline("stable-src", "2026-01-16", self._logs_b())
+        assert rb["ok"] is True
+
+        after = self._view(view_name)
+        # 邻批出数后，本批已落库的计数、修订号与取数依据保持不动
+        assert (json.dumps(after["results"], sort_keys=True), after["revision"],
+                after["source_entity_ids"]) == snapshot
+        # 邻批去重不驱逐本批明细（两批首行 time+level 相同）
+        entities_a = [p for p in store.rows("parsed_entity") if p.get("来源批次") == batch_a]
+        assert all(p["status"] == "校验通过" for p in entities_a)
+
+    def test_late_correction_recompute_and_export(self, pipeline):
+        ra = pipeline.run_full_pipeline("corr-src", "2026-01-15", self._logs_a())
+        rb = pipeline.run_full_pipeline("corr-src", "2026-01-16", self._logs_b())
+        batch_a, batch_b = ra["batch_no"], rb["batch_no"]
+        view_a_name, view_b_name = f"view-{batch_a}", f"view-{batch_b}"
+        view_b_before = json.dumps(self._view(view_b_name)["results"], sort_keys=True)
+
+        # 只为 A 批加一行迟到更正，再次计算
+        corr = pipeline.add_batch_correction(batch_a, [{"body": "2026-01-15T10:03:00|INFO|a-fix"}])
+        assert corr["ok"] is True
+        assert corr["line_range"] == ["4", "4"]
+        re = pipeline.refresh_aggregation(view_a_name, "level", "time", "count", batch_no=batch_a)
+        assert re["revision"] == 2
+
+        view_a = self._view(view_a_name)
+        assert view_a["results"]["INFO"]["count"] == 3
+        assert view_a["results"]["WARN"]["count"] == 1
+        ids_a = json.loads(view_a["source_entity_ids"])
+        assert len(ids_a) == 4 == view_a["source_records"]
+        assert sum(d["count"] for d in view_a["results"].values()) == 4
+        # 明细数：本批校验通过明细与视图取数依据一一对应
+        entities_a = [p for p in store.rows("parsed_entity")
+                      if p.get("来源批次") == batch_a and p.get("status") == "校验通过"]
+        assert len(entities_a) == 4
+        # 邻批聚合详情不受本批更正影响
+        assert json.dumps(self._view(view_b_name)["results"], sort_keys=True) == view_b_before
+        assert self._view(view_b_name)["revision"] == 1
+
+        # 交付：摘要与详单落盘并回写文件索引清单，详单带原文行号供对账
+        out = pipeline.build_export(view_a_name, "csv")
+        assert out["record_count"] == 4
+        export_dir = os.environ["LOG_INGEST_EXPORT_DIR"]
+        with open(out["summary_file"], encoding="utf-8") as fh:
+            summary = json.load(fh)
+        assert summary["批次编号"] == batch_a
+        assert summary["明细数"] == 4
+        assert summary["revision"] == 2
+        with open(out["detail_file"], encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == 4
+        assert [r["原始行号"] for r in rows] == ["1", "2", "3", "4"]
+        assert all(r["来源批次"] == batch_a for r in rows)
+        with open(os.path.join(export_dir, "index.json"), encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        entries = [e for e in manifest["exports"] if e["视图名称"] == view_a_name]
+        assert len(entries) == 2  # 首次交付 + 更正后再次交付
+        assert entries[-1]["revision"] == 2
+        assert entries[-1]["明细数"] == 4
+
+    def test_concurrent_correction_publishes_single_consistent_revision(self, pipeline):
+        ra = pipeline.run_full_pipeline("conc-src", "2026-01-15", self._logs_a())
+        batch_a = ra["batch_no"]
+        view_name = f"view-{batch_a}"
+
+        def worker(i: int) -> None:
+            pipeline.add_batch_correction(
+                batch_a, [{"body": f"2026-01-15T11:{i:02d}:00|INFO|fix-{i}"}])
+            pipeline.refresh_aggregation(view_name, "level", "time", "count", batch_no=batch_a)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 无论交错如何，落库的必是一套完整修订：计数与引用明细对得上
+        view = self._view(view_name)
+        ids = json.loads(view["source_entity_ids"])
+        assert sum(d["count"] for d in view["results"].values()) == len(ids)
+        pipeline.refresh_aggregation(view_name, "level", "time", "count", batch_no=batch_a)
+        view = self._view(view_name)
+        ids = json.loads(view["source_entity_ids"])
+        entities = [p for p in store.rows("parsed_entity")
+                    if p.get("来源批次") == batch_a and p.get("status") == "校验通过"]
+        assert len(ids) == len(entities) == 8
+        assert sum(d["count"] for d in view["results"].values()) == 8
+
+    def test_legacy_view_refresh_upserts_receipt(self, pipeline, sample_raw_logs):
+        pipeline.register_source("legacy-src", "http", "default")
+        pipeline.validate_source("legacy-src")
+        batch = pipeline.start_ingest_batch("legacy-src", "2026Q1", sample_raw_logs[:2])
+        batch_no = batch["batch"]["批次编号"]
+        pipeline.parse_batch(batch_no)
+        pipeline.validate_entities(batch_no)
+
+        # 兼容已有批次回执：不带批次的旧式刷新仍可用，同名视图只留一套修订
+        r1 = pipeline.refresh_aggregation("legacy-view", "level", "time", "count")
+        assert r1["ok"] is True
+        r2 = pipeline.refresh_aggregation("legacy-view", "level", "time", "count")
+        assert r2["revision"] == 2
+        views = [v for v in store.rows("aggregation_view") if v.get("视图名称") == "legacy-view"]
+        assert len(views) == 1
+        # 已有回执登记批次后，再刷新只统计对应批次的可用明细
+        view = views[0]
+        view["batch_no"] = batch_no
+        r3 = pipeline.refresh_aggregation("legacy-view", "level", "time", "count")
+        assert r3["batch_no"] == batch_no
+        ids = json.loads(r3["view"]["source_entity_ids"])
+        assert len(ids) == 2
+
+    def test_reparse_does_not_duplicate_details(self, pipeline, sample_raw_logs):
+        pipeline.register_source("reparse-src", "http", "default")
+        pipeline.validate_source("reparse-src")
+        batch = pipeline.start_ingest_batch("reparse-src", "2026Q1", sample_raw_logs[:2])
+        batch_no = batch["batch"]["批次编号"]
+        pipeline.parse_batch(batch_no)
+        again = pipeline.parse_batch(batch_no)
+        assert again["success"] == 0
+        parsed = [p for p in store.rows("parsed_entity") if p.get("来源批次") == batch_no]
+        assert len(parsed) == 2
+
+    def test_recover_reconfirms_batch_read_scope(self, pipeline):
+        pipeline.register_source("recv-scope-src", "http", "default")
+        pipeline.validate_source("recv-scope-src")
+        b1 = pipeline.start_ingest_batch("recv-scope-src", "2026Q1", [{"body": "x|y"}])
+        batch_1 = b1["batch"]["批次编号"]
+        pipeline.parse_batch(batch_1)
+        b2 = pipeline.start_ingest_batch("recv-scope-src", "2026Q2", [{"body": "p|q"}])
+        batch_2 = b2["batch"]["批次编号"]
+        pipeline.parse_batch(batch_2)
+
+        # 两批各置一条解析失败，恢复本批时不得越界到邻批
+        for no in (batch_1, batch_2):
+            raw = [r for r in store.rows("raw_records") if r.get("批次编号") == no][0]
+            raw["status"] = "解析失败"
+        result = pipeline.recover_batch(batch_1)
+        assert result["recovered"] == 1
+        raw_1 = [r for r in store.rows("raw_records") if r.get("批次编号") == batch_1][0]
+        raw_2 = [r for r in store.rows("raw_records") if r.get("批次编号") == batch_2][0]
+        assert raw_1["status"] == "待解析"
+        assert raw_2["status"] == "解析失败"
